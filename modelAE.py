@@ -30,11 +30,11 @@ class generator(Model):
 		elif self.phase==1 or self.phase==2:
 			self.convex_layer_weights = tf.Variable(initializer(shape=[self.p_dim, self.c_dim]), name="convex_layer_weights", trainable=False)
 			self.concave_layer_weights = tf.Variable(initializer2(shape=[self.c_dim, 1]), name="concave_layer_weights", trainable=False)
-		elif self.phase==3:
+		elif self.phase==3 or self.phase==4:
 			self.convex_layer_weights = tf.Variable(initializer(shape=[self.p_dim, self.c_dim]), name="convex_layer_weights", trainable=True)
 			self.concave_layer_weights = tf.Variable(initializer2(shape=[self.c_dim, 1]), name="concave_layer_weights", trainable=False)
 
-	def call(self, points, plane_m, is_training=False):
+	def call(self, points, plane_m, convex_mask=None, is_training=False):
 		if self.phase==0:
 			#level 1
 			h1 = tf.linalg.matmul(points, plane_m)
@@ -58,10 +58,13 @@ class generator(Model):
 			h2 = tf.linalg.matmul(h1, tf.cast(self.convex_layer_weights>0.01, self.convex_layer_weights.dtype))
 
 			#level 3
-			h3 = tf.math.reduce_min(h2, axis=2, keepdims=True)
+			if convex_mask is None:
+				h3 = tf.math.reduce_min(h2, axis=2, keepdims=True)
+			else:
+				h3 = tf.math.reduce_min(h2+convex_mask, axis=2, keepdims=True)
 
 			return h2,h3
-		elif self.phase==3:
+		elif self.phase==3 or self.phase==4:
 			#level 1
 			h1 = tf.linalg.matmul(points, plane_m)
 			h1 = tf.math.maximum(h1, 0)
@@ -70,13 +73,13 @@ class generator(Model):
 			h2 = tf.linalg.matmul(h1, self.convex_layer_weights)
 
 			#level 3
-			h3 = tf.math.reduce_min(h2, axis=2, keepdims=True)
+			if convex_mask is None:
+				h3 = tf.math.reduce_min(h2, axis=2, keepdims=True)
+			else:
+				h3 = tf.math.reduce_min(h2+convex_mask, axis=2, keepdims=True)
 
 			return h2,h3
-		else:
-			print("Congrats you got an error!")
-			print("generator.phase should be in [0,1,2,3], got", self.phase)
-			exit(0)
+
 
 class encoder(Model):
 	def __init__(self, ef_dim):
@@ -145,18 +148,18 @@ class bsp_network(Model):
 		self.decoder = decoder(self.ef_dim, self.p_dim)
 		self.generator = generator(self.phase, self.p_dim, self.c_dim)
 
-	def call(self, inputs, z_vector, plane_m, point_coord, is_training=False):
+	def call(self, inputs, z_vector, plane_m, point_coord, convex_mask=None, is_training=False):
 		if is_training:
 			z_vector = self.encoder(inputs, is_training=is_training)
 			plane_m = self.decoder(z_vector, is_training=is_training)
-			net_out_convexes, net_out = self.generator(point_coord, plane_m, is_training=is_training)
+			net_out_convexes, net_out = self.generator(point_coord, plane_m, convex_mask=convex_mask, is_training=is_training)
 		else:
 			if inputs is not None:
 				z_vector = self.encoder(inputs, is_training=is_training)
 			if z_vector is not None:
 				plane_m = self.decoder(z_vector, is_training=is_training)
 			if point_coord is not None:
-				net_out_convexes, net_out = self.generator(point_coord, plane_m, is_training=is_training)
+				net_out_convexes, net_out = self.generator(point_coord, plane_m, convex_mask=convex_mask, is_training=is_training)
 			else:
 				net_out_convexes = None
 				net_out = None
@@ -283,7 +286,18 @@ class BSP_AE(object):
 			#soft cut with loss L_T: gradually move the values in T (cw2) to either 0 or 1
 			def network_loss(G2,G,point_value,cw2,cw3):
 				loss_sp = tf.math.reduce_mean((1-point_value)*(1-tf.math.minimum(G,1)) + point_value*(tf.math.maximum(G,0)))
-				loss = loss_sp + (tf.math.reduce_sum(tf.math.minimum(tf.math.abs(cw2)*100,tf.math.abs(cw2-1))))
+				loss = loss_sp + tf.math.reduce_sum(tf.math.abs(cw2)*tf.cast(cw2<0.01, tf.float32)) + tf.math.reduce_sum(tf.math.abs(cw2-1)*tf.cast(cw2>=0.01, tf.float32))
+				return loss_sp,loss
+			self.loss = network_loss
+		elif config.phase==4:
+			#phase 4 soft discrete for bsp with L_overlap
+			#L_recon + L_T + L_overlap
+			#soft cut with loss L_T: gradually move the values in T (cw2) to either 0 or 1
+			def network_loss(G2,G,point_value,cw2,cw3):
+				loss_sp = tf.math.reduce_mean((1-point_value)*(1-tf.math.minimum(G,1)) + point_value*(tf.math.maximum(G,0)))
+				G2_inside = tf.cast(G2<0.01, tf.float32)
+				bmask = G2_inside * tf.cast(tf.reduce_sum(G2_inside, axis=2, keepdims=True)>1, tf.float32)
+				loss = loss_sp + tf.math.reduce_sum(tf.math.abs(cw2)*tf.cast(cw2<0.01, tf.float32)) + tf.math.reduce_sum(tf.math.abs(cw2-1)*tf.cast(cw2>=0.01, tf.float32)) - tf.math.reduce_mean(G2*point_value*bmask)
 				return loss_sp,loss
 			self.loss = network_loss
 
@@ -436,9 +450,9 @@ class BSP_AE(object):
 			print(len(bsp_convex_list))
 			
 			#convert bspt to mesh
-			vertices, polygons = get_mesh(bsp_convex_list)
+			#vertices, polygons = get_mesh(bsp_convex_list)
 			#use the following alternative to merge nearby vertices to get watertight meshes
-			#vertices, polygons = get_mesh_watertight(bsp_convex_list)
+			vertices, polygons = get_mesh_watertight(bsp_convex_list)
 
 			#output ply
 			write_ply_polygon(config.sample_dir+"/"+str(t)+"_bsp.ply", vertices, polygons)
@@ -474,44 +488,93 @@ class BSP_AE(object):
 			
 			out_m = out_m.numpy()
 
-			bsp_convex_list = []
-			model_float = model_float<0.01
-			model_float_sum = np.sum(model_float,axis=3)
-			for i in range(self.c_dim):
-				slice_i = model_float[:,:,:,i]
-				if np.max(slice_i)>0: #if one voxel is inside a convex
-					#if np.min(model_float_sum-slice_i*2)>=0: #if this convex is redundant, i.e. the convex is inside the shape
-					#	model_float_sum = model_float_sum-slice_i
-					#else:
-						box = []
-						for j in range(self.p_dim):
-							if w2[j,i]>0.01:
-								a = -out_m[0,0,j]
-								b = -out_m[0,1,j]
-								c = -out_m[0,2,j]
-								d = -out_m[0,3,j]
-								box.append([a,b,c,d])
-						if len(box)>0:
-							bsp_convex_list.append(np.array(box,np.float32))
-							
-			#convert bspt to mesh
-			vertices, polygons = get_mesh(bsp_convex_list)
-			#use the following alternative to merge nearby vertices to get watertight meshes
-			#vertices, polygons = get_mesh_watertight(bsp_convex_list)
-
-			#output ply
-			write_ply_polygon(config.sample_dir+"/"+str(t)+"_bsp.ply", vertices, polygons)
+			# whether to use post processing to remove convexes that are inside the shape
+			post_processing_flag = False
 			
-			#sample surface points
-			sampled_points_normals = sample_points_polygon_vox64(vertices, polygons, model_float_combined, 16000)
-			#check point inside shape or not
-			point_coord = np.reshape(sampled_points_normals[:,:3]+sampled_points_normals[:,3:]*1e-4, [1,-1,3])
-			point_coord = np.concatenate([point_coord, np.ones([1,point_coord.shape[1],1],np.float32) ],axis=2)
-			_,_,_, sample_points_value = self.bsp_network(None, None, out_m, point_coord, is_training=False)
-			sampled_points_normals = sampled_points_normals[sample_points_value[0,:,0]>1e-4]
-			print(len(bsp_convex_list), len(sampled_points_normals))
-			np.random.shuffle(sampled_points_normals)
-			write_ply_point_normal(config.sample_dir+"/"+str(t)+"_pc.ply", sampled_points_normals[:4096])
+			if post_processing_flag:
+				bsp_convex_list = []
+				model_float = model_float<0.01
+				model_float_sum = np.sum(model_float,axis=3)
+				unused_convex = np.ones([self.c_dim], np.float32)
+				for i in range(self.c_dim):
+					slice_i = model_float[:,:,:,i]
+					if np.max(slice_i)>0: #if one voxel is inside a convex
+						if np.min(model_float_sum-slice_i*2)>=0: #if this convex is redundant, i.e. the convex is inside the shape
+							model_float_sum = model_float_sum-slice_i
+						else:
+							box = []
+							for j in range(self.p_dim):
+								if w2[j,i]>0.01:
+									a = -out_m[0,0,j]
+									b = -out_m[0,1,j]
+									c = -out_m[0,2,j]
+									d = -out_m[0,3,j]
+									box.append([a,b,c,d])
+							if len(box)>0:
+								bsp_convex_list.append(np.array(box,np.float32))
+								unused_convex[i] = 0
+								
+				#convert bspt to mesh
+				#vertices, polygons = get_mesh(bsp_convex_list)
+				#use the following alternative to merge nearby vertices to get watertight meshes
+				vertices, polygons = get_mesh_watertight(bsp_convex_list)
+
+				#output ply
+				write_ply_polygon(config.sample_dir+"/"+str(t)+"_bsp.ply", vertices, polygons)
+				#output obj
+				#write_obj_polygon(config.sample_dir+"/"+str(t)+"_bsp.obj", vertices, polygons)
+				
+				#sample surface points
+				sampled_points_normals = sample_points_polygon_vox64(vertices, polygons, model_float_combined, 16384)
+				#check point inside shape or not
+				point_coord = np.reshape(sampled_points_normals[:,:3]+sampled_points_normals[:,3:]*1e-4, [1,-1,3])
+				point_coord = np.concatenate([point_coord, np.ones([1,point_coord.shape[1],1],np.float32) ],axis=2)
+				_,_,_, sample_points_value = self.bsp_network(None, None, out_m, point_coord, convex_mask=np.reshape(unused_convex, [1,1,-1]), is_training=False)
+				sampled_points_normals = sampled_points_normals[sample_points_value[0,:,0]>1e-4]
+				print(len(bsp_convex_list), len(sampled_points_normals))
+				np.random.shuffle(sampled_points_normals)
+				write_ply_point_normal(config.sample_dir+"/"+str(t)+"_pc.ply", sampled_points_normals[:4096])
+			else:
+				bsp_convex_list = []
+				model_float = model_float<0.01
+				model_float_sum = np.sum(model_float,axis=3)
+				for i in range(self.c_dim):
+					slice_i = model_float[:,:,:,i]
+					if np.max(slice_i)>0: #if one voxel is inside a convex
+						#if np.min(model_float_sum-slice_i*2)>=0: #if this convex is redundant, i.e. the convex is inside the shape
+						#	model_float_sum = model_float_sum-slice_i
+						#else:
+							box = []
+							for j in range(self.p_dim):
+								if w2[j,i]>0.01:
+									a = -out_m[0,0,j]
+									b = -out_m[0,1,j]
+									c = -out_m[0,2,j]
+									d = -out_m[0,3,j]
+									box.append([a,b,c,d])
+							if len(box)>0:
+								bsp_convex_list.append(np.array(box,np.float32))
+								
+				#convert bspt to mesh
+				#vertices, polygons = get_mesh(bsp_convex_list)
+				#use the following alternative to merge nearby vertices to get watertight meshes
+				vertices, polygons = get_mesh_watertight(bsp_convex_list)
+
+				#output ply
+				write_ply_polygon(config.sample_dir+"/"+str(t)+"_bsp.ply", vertices, polygons)
+				#output obj
+				#write_obj_polygon(config.sample_dir+"/"+str(t)+"_bsp.obj", vertices, polygons)
+				
+				#sample surface points
+				sampled_points_normals = sample_points_polygon_vox64(vertices, polygons, model_float_combined, 16384)
+				#check point inside shape or not
+				point_coord = np.reshape(sampled_points_normals[:,:3]+sampled_points_normals[:,3:]*1e-4, [1,-1,3])
+				point_coord = np.concatenate([point_coord, np.ones([1,point_coord.shape[1],1],np.float32) ],axis=2)
+				_,_,_, sample_points_value = self.bsp_network(None, None, out_m, point_coord, is_training=False)
+				sampled_points_normals = sampled_points_normals[sample_points_value[0,:,0]>1e-4]
+				print(len(bsp_convex_list), len(sampled_points_normals))
+				np.random.shuffle(sampled_points_normals)
+				write_ply_point_normal(config.sample_dir+"/"+str(t)+"_pc.ply", sampled_points_normals[:4096])
 
 
 	#output bsp shape as obj with color
